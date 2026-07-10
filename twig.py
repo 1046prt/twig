@@ -2,6 +2,7 @@
 """twig"""
 
 import hashlib
+import fnmatch
 import os
 import sys
 import time
@@ -100,6 +101,11 @@ def cmd_add(args):
             print(f"twig: path '{filepath}' does not exist", file=sys.stderr)
             sys.exit(1)
 
+        ignore_patterns = _load_ignore_patterns()
+        if _is_ignored(filepath, ignore_patterns):
+            print(f"twig: '{filepath}' is ignored by .twigignore", file=sys.stderr)
+            continue
+
         with open(filepath, "rb") as f:
             data = f.read()
 
@@ -182,6 +188,10 @@ def cmd_commit(args):
     commit_hash = hash_object(commit_content.encode(), obj_type="commit", write=True)
 
     branch = get_current_branch() or "main"
+
+    # Write reflog BEFORE updating the ref
+    _reflog_write(branch, commit_hash, f"commit: {message}")
+
     ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
     os.makedirs(os.path.dirname(ref_path), exist_ok=True)
     with open(ref_path, "w") as f:
@@ -193,6 +203,9 @@ def cmd_commit(args):
 
 def cmd_log(args):
     """Phase 5: Walk the commit history."""
+    if "--graph" in args:
+        return cmd_log_graph(args)
+
     commit_hash = get_current_commit()
     if not commit_hash:
         print("no commits yet", file=sys.stderr)
@@ -350,6 +363,14 @@ def cmd_checkout(args):
         with open(filename, "wb") as f:
             f.write(blob_data)
         print(f"restored {filename}")
+
+    # Write reflog entry to TARGET branch BEFORE updating HEAD
+    if os.path.exists(os.path.join(TWIG_DIR, "refs", "heads", target)):
+        _reflog_write(target, commit_hash, f"checkout: moving to {commit_hash[:8]}")
+    else:
+        branch_name = get_current_branch()
+        if branch_name:
+            _reflog_write(branch_name, commit_hash, f"checkout: moving to {commit_hash[:8]}")
 
     # Update HEAD to point to the branch or detached commit
     head_path = os.path.join(TWIG_DIR, "HEAD")
@@ -669,11 +690,13 @@ def cmd_status(args):
 
     # Check for untracked files
     all_tracked = set(list(head_entries.keys()) + list(index_entries.keys()))
+    ignore_patterns = _load_ignore_patterns()
     for entry in os.listdir("."):
         if entry.startswith(".") or entry == "twig.py" or entry == "__pycache__":
             continue
         if os.path.isfile(entry) and entry not in all_tracked:
-            untracked.append(entry)
+            if not _is_ignored(entry, ignore_patterns):
+                untracked.append(entry)
 
     # Print output
     branch = get_current_branch() or "HEAD"
@@ -847,6 +870,742 @@ def cmd_tag(args):
     print(f"created tag '{tag_name}' at {commit_hash[:8]}")
 
 
+def cmd_reset(args):
+    """Phase 15: Reset current branch to a commit.
+
+    --soft:  move branch pointer only
+    --mixed: move branch pointer + reset index (default)
+    --hard:  move branch pointer + reset index + reset working tree
+    """
+    mode = "mixed"
+    target = None
+
+    for arg in args:
+        if arg.startswith("--"):
+            mode = arg[2:]
+            if mode not in ("soft", "mixed", "hard"):
+                print(f"twig: unknown reset mode '{arg}'", file=sys.stderr)
+                sys.exit(1)
+        else:
+            target = arg
+
+    if not target:
+        print("usage: twig reset [--soft|--mixed|--hard] <commit>", file=sys.stderr)
+        sys.exit(1)
+
+    if os.path.exists(os.path.join(TWIG_DIR, "refs", "heads", target)):
+        with open(os.path.join(TWIG_DIR, "refs", "heads", target), "r") as f:
+            commit_hash = f.read().strip()
+    else:
+        commit_hash = target
+
+    obj_type, _ = read_object(commit_hash)
+    if obj_type != "commit":
+        print(f"twig: '{target}' is not a valid commit", file=sys.stderr)
+        sys.exit(1)
+
+    branch = get_current_branch()
+    if not branch:
+        print("twig: not on a branch (detached HEAD)", file=sys.stderr)
+        sys.exit(1)
+
+    ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
+    with open(ref_path, "w") as f:
+        f.write(commit_hash + "\n")
+
+    if mode in ("mixed", "hard"):
+        tree_hash = tree_from_commit(commit_hash)
+        entries = parse_tree(tree_hash) if tree_hash else {}
+        write_index(entries)
+
+    if mode == "hard":
+        tree_hash = tree_from_commit(commit_hash)
+        entries = parse_tree(tree_hash) if tree_hash else {}
+        for existing in os.listdir("."):
+            if existing.startswith(".") or existing == "twig.py" or existing == "__pycache__":
+                continue
+            if os.path.isfile(existing) and existing not in entries:
+                os.remove(existing)
+        for filename, blob_hash in entries.items():
+            _, blob_data = read_object(blob_hash)
+            with open(filename, "wb") as f:
+                f.write(blob_data)
+
+    _reflog_write(branch, commit_hash, f"reset: moving to {commit_hash[:8]}")
+    print(f"HEAD is now at {commit_hash[:8]} ({mode} reset)")
+
+
+def _reflog_write(branch, new_hash, reason=""):
+    """Append an entry to the reflog for a branch."""
+    reflog_path = os.path.join(TWIG_DIR, "logs", "refs", "heads", branch)
+    os.makedirs(os.path.dirname(reflog_path), exist_ok=True)
+
+    old_hash = ""
+    ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
+    if os.path.exists(ref_path):
+        with open(ref_path, "r") as f:
+            old_hash = f.read().strip()
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"{old_hash} {new_hash} twig <twig@local> {ts} {reason}\n"
+    with open(reflog_path, "a") as f:
+        f.write(entry)
+
+
+def cmd_reflog(args):
+    """Phase 21: Show the reflog (all HEAD movements)."""
+    branch = get_current_branch()
+    if not branch:
+        print("twig: not on a branch", file=sys.stderr)
+        sys.exit(1)
+
+    reflog_path = os.path.join(TWIG_DIR, "logs", "refs", "heads", branch)
+    if not os.path.exists(reflog_path):
+        print("reflog is empty")
+        return
+
+    with open(reflog_path, "r") as f:
+        entries = f.readlines()
+
+    for i, entry in enumerate(reversed(entries)):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(" ", 4)
+        if len(parts) >= 5:
+            old_h, new_h = parts[0][:8], parts[1][:8]
+            rest = parts[4]
+            print(f"{i}: {old_h} -> {new_h} {rest}")
+
+
+def cmd_stash(args):
+    """Phase 16: Stash working directory and index changes."""
+    subcmd = args[0] if args else "save"
+
+    stash_dir = os.path.join(TWIG_DIR, "stash")
+    os.makedirs(stash_dir, exist_ok=True)
+
+    if subcmd == "save" or subcmd == "push":
+        index_entries = read_index()
+        commit_hash = get_current_commit()
+        head_tree = tree_from_commit(commit_hash) if commit_hash else None
+        head_entries = parse_tree(head_tree) if head_tree else {}
+
+        has_changes = False
+        stash_index = {}
+        stash_files = {}
+
+        for filepath, sha1 in index_entries.items():
+            if filepath not in head_entries or head_entries[filepath] != sha1:
+                stash_index[filepath] = sha1
+                has_changes = True
+
+        for filepath, index_sha1 in index_entries.items():
+            if not os.path.exists(filepath):
+                continue
+            with open(filepath, "rb") as f:
+                data = f.read()
+            work_sha1 = hash_object(data, write=False)
+            if work_sha1 != index_sha1:
+                stash_files[filepath] = data
+                has_changes = True
+
+        for filepath in index_entries:
+            if not os.path.exists(filepath):
+                stash_files[filepath] = None
+                has_changes = True
+
+        if not has_changes:
+            print("No local changes to save")
+            return
+
+        existing = sorted([int(f) for f in os.listdir(stash_dir) if f.isdigit()])
+        stash_num = existing[-1] + 1 if existing else 0
+
+        stash_path = os.path.join(stash_dir, str(stash_num))
+        os.makedirs(stash_path, exist_ok=True)
+
+        with open(os.path.join(stash_path, "index"), "w") as f:
+            for filepath, sha1 in sorted(stash_index.items()):
+                f.write(f"{filepath} {sha1}\n")
+
+        files_dir = os.path.join(stash_path, "files")
+        os.makedirs(files_dir, exist_ok=True)
+        for filepath, data in stash_files.items():
+            safe_name = filepath.replace("/", "_").replace("\\", "_")
+            if data is None:
+                with open(os.path.join(files_dir, safe_name + ".deleted"), "w") as f:
+                    pass
+            else:
+                with open(os.path.join(files_dir, safe_name), "wb") as f:
+                    f.write(data)
+
+        with open(os.path.join(stash_path, "parent"), "w") as f:
+            f.write(commit_hash or "")
+
+        with open(os.path.join(stash_path, "branch"), "w") as f:
+            f.write(get_current_branch() or "")
+
+        branch_name = get_current_branch() or "main"
+        msg = f"WIP on {branch_name}: {commit_hash[:8] if commit_hash else 'no commits'}"
+        with open(os.path.join(stash_path, "message"), "w") as f:
+            f.write(msg)
+
+        if commit_hash:
+            entries = parse_tree(head_tree) if head_tree else {}
+            for filepath in list(index_entries.keys()):
+                if filepath in entries:
+                    _, blob_data = read_object(entries[filepath])
+                    with open(filepath, "wb") as f:
+                        f.write(blob_data)
+                elif os.path.exists(filepath):
+                    os.remove(filepath)
+
+        write_index(head_entries)
+        print(f"Saved working directory and index state {msg}")
+
+    elif subcmd == "pop":
+        existing = sorted([int(f) for f in os.listdir(stash_dir) if f.isdigit()])
+        if not existing:
+            print("No stash entries found")
+            return
+        _apply_stash(stash_num := existing[-1])
+        import shutil
+        shutil.rmtree(os.path.join(stash_dir, str(stash_num)))
+        print(f"Dropped refs/stash@{{{stash_num}}}")
+
+    elif subcmd == "apply":
+        existing = sorted([int(f) for f in os.listdir(stash_dir) if f.isdigit()])
+        if not existing:
+            print("No stash entries found")
+            return
+        _apply_stash(existing[-1])
+        print(f"Applied stash@{{{existing[-1]}}}")
+
+    elif subcmd == "list":
+        existing = sorted([int(f) for f in os.listdir(stash_dir) if f.isdigit()])
+        if not existing:
+            return
+        for num in reversed(existing):
+            stash_path = os.path.join(stash_dir, str(num))
+            msg_path = os.path.join(stash_path, "message")
+            if os.path.exists(msg_path):
+                with open(msg_path, "r") as f:
+                    msg = f.read().strip()
+                print(f"stash@{{{num}}}: {msg}")
+
+    elif subcmd == "drop":
+        existing = sorted([int(f) for f in os.listdir(stash_dir) if f.isdigit()])
+        if not existing:
+            print("No stash entries found")
+            return
+        stash_num = existing[-1]
+        import shutil
+        shutil.rmtree(os.path.join(stash_dir, str(stash_num)))
+        print(f"Dropped refs/stash@{{{stash_num}}}")
+
+    elif subcmd == "clear":
+        import shutil
+        for f in os.listdir(stash_dir):
+            p = os.path.join(stash_dir, f)
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+        print("All stash entries cleared")
+
+    else:
+        print("usage: twig stash [save|pop|apply|list|drop|clear]", file=sys.stderr)
+        sys.exit(1)
+
+
+def _apply_stash(stash_num):
+    """Apply a stash entry to the working directory."""
+    stash_path = os.path.join(TWIG_DIR, "stash", str(stash_num))
+    if not os.path.exists(stash_path):
+        print(f"stash@{{{stash_num}}} not found", file=sys.stderr)
+        sys.exit(1)
+
+    stash_index = {}
+    index_path = os.path.join(stash_path, "index")
+    if os.path.exists(index_path):
+        with open(index_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2:
+                        stash_index[parts[0]] = parts[1]
+
+    files_dir = os.path.join(stash_path, "files")
+    if os.path.exists(files_dir):
+        for safe_name in os.listdir(files_dir):
+            if safe_name.endswith(".deleted"):
+                filepath = safe_name[:-8].replace("_", "/")
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            else:
+                filepath = safe_name.replace("_", "/")
+                with open(os.path.join(files_dir, safe_name), "rb") as f:
+                    data = f.read()
+                with open(filepath, "wb") as f:
+                    f.write(data)
+
+    current_index = read_index()
+    current_index.update(stash_index)
+    write_index(current_index)
+
+
+def cmd_rebase(args):
+    """Phase 17: Rebase current branch onto another branch."""
+    if not args:
+        print("usage: twig rebase <upstream>", file=sys.stderr)
+        sys.exit(1)
+
+    upstream_name = args[0]
+    upstream_ref = os.path.join(TWIG_DIR, "refs", "heads", upstream_name)
+    if not os.path.exists(upstream_ref):
+        print(f"twig: branch '{upstream_name}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(upstream_ref, "r") as f:
+        upstream_hash = f.read().strip()
+
+    current_hash = get_current_commit()
+    branch = get_current_branch()
+
+    if not current_hash or not branch:
+        print("twig: no current commit", file=sys.stderr)
+        sys.exit(1)
+
+    if current_hash == upstream_hash:
+        print("Already up to date.")
+        return
+
+    lca = lowest_common_ancestor(current_hash, upstream_hash)
+    if not lca:
+        print("twig: no common ancestor found", file=sys.stderr)
+        sys.exit(1)
+
+    commits_to_replay = []
+    h = current_hash
+    while h and h != lca:
+        commits_to_replay.append(h)
+        parents = get_all_parents(h)
+        h = parents[0] if parents else None
+
+    if not commits_to_replay:
+        print("Nothing to rebase")
+        return
+
+    commits_to_replay.reverse()
+
+    ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
+    with open(ref_path, "w") as f:
+        f.write(upstream_hash + "\n")
+
+    for commit_hash in commits_to_replay:
+        obj_type, data = read_object(commit_hash)
+        if obj_type != "commit":
+            continue
+
+        content = data.decode()
+        old_tree_hash = None
+        message = ""
+        for line in content.split("\n"):
+            if line.startswith("tree "):
+                old_tree_hash = line.split(" ", 1)[1]
+            elif line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+                message = line
+
+        old_entries = parse_tree(old_tree_hash) if old_tree_hash else {}
+
+        # Get parent commit of source (to know what the base was)
+        source_parents = get_all_parents(commit_hash)
+        source_parent_entries = {}
+        if source_parents:
+            sp_tree = tree_from_commit(source_parents[0])
+            source_parent_entries = parse_tree(sp_tree) if sp_tree else {}
+
+        # Current HEAD tree
+        parent_hash = get_current_commit()
+        parent_tree = tree_from_commit(parent_hash) if parent_hash else None
+        parent_entries = parse_tree(parent_tree) if parent_tree else {}
+
+        # Apply diff: source_parent -> old_entries on top of parent_entries
+        new_entries = dict(parent_entries)
+        all_files = sorted(
+            set(list(source_parent_entries.keys()) + list(old_entries.keys()))
+        )
+
+        for filepath in all_files:
+            base_sha = source_parent_entries.get(filepath)
+            new_sha = old_entries.get(filepath)
+
+            if base_sha == new_sha:
+                continue
+
+            if new_sha and not base_sha:
+                new_entries[filepath] = new_sha
+            elif new_sha and base_sha:
+                new_entries[filepath] = new_sha
+            elif not new_sha and base_sha:
+                new_entries.pop(filepath, None)
+
+        tree_content = b""
+        for filepath, sha1 in sorted(new_entries.items()):
+            mode = "100644"
+            name = filepath.encode()
+            tree_content += f"{mode} ".encode() + name + b"\0" + sha1.encode() + b"\n"
+
+        new_tree_hash = hash_object(tree_content, obj_type="tree", write=True)
+
+        commit_content = f"tree {new_tree_hash}\n"
+        commit_content += f"parent {parent_hash}\n" if parent_hash else ""
+        commit_content += f"author twig <twig@local> {int(time.time())}\n"
+        commit_content += f"\n{message}\n"
+
+        new_commit_hash = hash_object(commit_content.encode(), obj_type="commit", write=True)
+
+        ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
+        with open(ref_path, "w") as f:
+            f.write(new_commit_hash + "\n")
+
+    print(f"Successfully rebased {branch} onto {upstream_name}")
+
+
+def cmd_cherry_pick(args):
+    """Phase 18: Apply a single commit from another branch."""
+    if not args:
+        print("usage: twig cherry-pick <commit>", file=sys.stderr)
+        sys.exit(1)
+
+    source_hash = args[0]
+    try:
+        obj_type, data = read_object(source_hash)
+    except FileNotFoundError:
+        print(f"twig: commit '{source_hash}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    if obj_type != "commit":
+        print(f"twig: '{source_hash}' is not a commit", file=sys.stderr)
+        sys.exit(1)
+
+    content = data.decode()
+    source_tree_hash = None
+    source_parents = []
+    message = ""
+    for line in content.split("\n"):
+        if line.startswith("tree "):
+            source_tree_hash = line.split(" ", 1)[1]
+        elif line.startswith("parent "):
+            source_parents.append(line.split(" ", 1)[1])
+        elif line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+            message = line
+
+    source_entries = parse_tree(source_tree_hash) if source_tree_hash else {}
+    source_parent_tree = tree_from_commit(source_parents[0]) if source_parents else None
+    source_parent_entries = parse_tree(source_parent_tree) if source_parent_tree else {}
+
+    current_hash = get_current_commit()
+    current_tree = tree_from_commit(current_hash) if current_hash else None
+    current_entries = parse_tree(current_tree) if current_tree else {}
+
+    new_entries = dict(current_entries)
+    all_files = sorted(
+        set(list(source_parent_entries.keys()) + list(source_entries.keys()))
+    )
+
+    for filepath in all_files:
+        base_sha = source_parent_entries.get(filepath)
+        source_sha = source_entries.get(filepath)
+        if base_sha == source_sha:
+            continue
+        if source_sha and not base_sha:
+            new_entries[filepath] = source_sha
+        elif source_sha and base_sha:
+            new_entries[filepath] = source_sha
+        elif not source_sha and base_sha:
+            new_entries.pop(filepath, None)
+
+    tree_content = b""
+    for filepath, sha1 in sorted(new_entries.items()):
+        mode = "100644"
+        name = filepath.encode()
+        tree_content += f"{mode} ".encode() + name + b"\0" + sha1.encode() + b"\n"
+
+    new_tree_hash = hash_object(tree_content, obj_type="tree", write=True)
+
+    commit_content = f"tree {new_tree_hash}\n"
+    if current_hash:
+        commit_content += f"parent {current_hash}\n"
+    commit_content += f"author twig <twig@local> {int(time.time())}\n"
+    commit_content += f"\n{message} (cherry-picked)\n"
+
+    new_commit_hash = hash_object(commit_content.encode(), obj_type="commit", write=True)
+
+    branch = get_current_branch() or "main"
+    ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
+    with open(ref_path, "w") as f:
+        f.write(new_commit_hash + "\n")
+
+    print(f"[{branch} {new_commit_hash[:8]}] {message} (cherry-picked)")
+
+
+def _collect_dag():
+    """BFS from all branch tips to build the full DAG."""
+    heads_dir = os.path.join(TWIG_DIR, "refs", "heads")
+    if not os.path.exists(heads_dir):
+        return {}
+
+    dag = {}
+    queue = deque()
+    visited = set()
+
+    for branch_name in sorted(os.listdir(heads_dir)):
+        ref_path = os.path.join(heads_dir, branch_name)
+        with open(ref_path, "r") as f:
+            h = f.read().strip()
+        if h not in visited:
+            queue.append(h)
+            visited.add(h)
+
+    while queue:
+        h = queue.popleft()
+        if h in dag:
+            continue
+
+        obj_type, data = read_object(h)
+        if obj_type != "commit":
+            continue
+
+        parents = []
+        message = ""
+        for line in data.decode().split("\n"):
+            if line.startswith("parent "):
+                parents.append(line.split(" ", 1)[1])
+            elif line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+                message = line
+
+        dag[h] = {"parents": parents, "message": message}
+
+        for parent in parents:
+            if parent not in visited:
+                queue.append(parent)
+                visited.add(parent)
+
+    return dag
+
+
+def cmd_log_graph(args):
+    """Phase 19: Show commit history with ASCII DAG graph."""
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    dag = _collect_dag()
+
+    heads_dir = os.path.join(TWIG_DIR, "refs", "heads")
+    hash_to_branch = {}
+    if os.path.exists(heads_dir):
+        for branch_name in os.listdir(heads_dir):
+            ref_path = os.path.join(heads_dir, branch_name)
+            with open(ref_path, "r") as f:
+                h = f.read().strip()
+            hash_to_branch[h] = branch_name
+
+    visited = set()
+    queue = deque([(commit_hash, "", True)])
+
+    while queue:
+        h, prefix, is_last = queue.popleft()
+        if h in visited or h not in dag:
+            continue
+        visited.add(h)
+
+        node = dag[h]
+        branch_label = ""
+        if h in hash_to_branch:
+            branch_label = f" ({hash_to_branch[h]})"
+        if h == commit_hash:
+            branch_label += " <- HEAD"
+
+        connector = prefix
+        print(f"{connector}* {h[:8]}{branch_label}")
+        print(f"{connector}  {node['message']}")
+
+        for i, parent in enumerate(node["parents"]):
+            if parent not in visited:
+                is_last_parent = (i == len(node["parents"]) - 1)
+                if len(node["parents"]) > 1 and i == 0:
+                    next_prefix = prefix + "| "
+                elif is_last_parent:
+                    next_prefix = prefix
+                else:
+                    next_prefix = prefix + "| "
+                queue.append((parent, next_prefix, is_last_parent))
+
+
+def cmd_blame(args):
+    """Phase 20: Show who last modified each line of a file."""
+    if not args:
+        print("usage: twig blame <file>", file=sys.stderr)
+        sys.exit(1)
+
+    filepath = args[0]
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    # Walk all commits, find the most recent one that changed each line
+    # Build a list of (commit_hash, message) in reverse chronological order
+    commits = []
+    queue = deque([commit_hash])
+    visited = set()
+    while queue:
+        h = queue.popleft()
+        if h in visited:
+            continue
+        visited.add(h)
+        obj_type, data = read_object(h)
+        if obj_type != "commit":
+            continue
+
+        content = data.decode()
+        message = ""
+        for line in content.split("\n"):
+            if line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+                message = line
+                break
+
+        commits.append((h, message))
+        for parent in get_all_parents(h):
+            queue.append(parent)
+
+    if not commits:
+        print("no commits found")
+        return
+
+    # For each line, find earliest commit that has the same line
+    current_tree = tree_from_commit(commit_hash)
+    entries = parse_tree(current_tree) if current_tree else {}
+
+    if filepath not in entries:
+        print(f"twig: '{filepath}' not found in current commit", file=sys.stderr)
+        sys.exit(1)
+
+    _, blob_data = read_object(entries[filepath])
+    current_lines = blob_data.decode().splitlines()
+
+    # Get all trees for blame lookup
+    commit_trees = {}
+    for ch, _ in commits:
+        th = tree_from_commit(ch)
+        commit_trees[ch] = parse_tree(th) if th else {}
+
+    # For each line, walk back to find who introduced it
+    blame_result = []
+    for line in current_lines:
+        blame_commit = commits[0][0]
+        blame_msg = commits[0][1]
+
+        for ch, msg in commits:
+            ch_entries = commit_trees.get(ch, {})
+            if filepath in ch_entries:
+                _, ch_data = read_object(ch_entries[filepath])
+                ch_lines = ch_data.decode().splitlines()
+                if line in ch_lines:
+                    blame_commit = ch
+                    blame_msg = msg
+                    break
+
+        blame_result.append((blame_commit[:8], line, blame_msg))
+
+        for ch_hash, line, msg in blame_result:
+            print(f"{ch_hash} | {line}  ({msg})")
+
+
+def cmd_config(args):
+    """Phase 22: Get/set user configuration."""
+    config_path = os.path.join(TWIG_DIR, "config")
+
+    if not args or args[0] == "--list":
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                print(f.read(), end="")
+        else:
+            print("no configuration set")
+        return
+
+    if len(args) == 1:
+        key = args[0]
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith(key + " = "):
+                        print(line.split(" = ", 1)[1])
+                        return
+        print(f"key '{key}' not found")
+        return
+
+    if args[0] == "--unset":
+        key = args[1]
+        if os.path.exists(config_path):
+            lines = []
+            with open(config_path, "r") as f:
+                for line in f:
+                    if not line.strip().startswith(key + " = "):
+                        lines.append(line)
+            with open(config_path, "w") as f:
+                f.writelines(lines)
+            print(f"key '{key}' removed")
+        return
+
+    key = args[0]
+    value = args[1] if len(args) > 1 else ""
+
+    config = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if " = " in line:
+                    k, v = line.split(" = ", 1)
+                    config[k] = v
+
+    config[key] = value
+
+    with open(config_path, "w") as f:
+        for k, v in sorted(config.items()):
+            f.write(f"{k} = {v}\n")
+
+    print(f"{key} = {value}")
+
+
+def _load_ignore_patterns():
+    """Load ignore patterns from .twigignore."""
+    patterns = []
+    ignore_path = ".twigignore"
+    if os.path.exists(ignore_path):
+        with open(ignore_path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    return patterns
+
+
+def _is_ignored(filepath, patterns):
+    """Check if a filepath matches any ignore pattern."""
+    for pattern in patterns:
+        if fnmatch.fnmatch(filepath, pattern):
+            return True
+        if fnmatch.fnmatch(os.path.basename(filepath), pattern):
+            return True
+    return False
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: twig <command> [<args>]", file=sys.stderr)
@@ -870,6 +1629,13 @@ def main():
         "cat-file": lambda: cmd_cat_file(args),
         "rm": lambda: cmd_rm(args),
         "tag": lambda: cmd_tag(args),
+        "reset": lambda: cmd_reset(args),
+        "stash": lambda: cmd_stash(args),
+        "rebase": lambda: cmd_rebase(args),
+        "cherry-pick": lambda: cmd_cherry_pick(args),
+        "reflog": lambda: cmd_reflog(args),
+        "blame": lambda: cmd_blame(args),
+        "config": lambda: cmd_config(args),
     }
 
     if command in commands:
