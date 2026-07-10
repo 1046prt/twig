@@ -1,0 +1,3 @@
+.twig/
+__pycache__/
+*.txt
