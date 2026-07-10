@@ -1606,6 +1606,346 @@ def _is_ignored(filepath, patterns):
     return False
 
 
+def cmd_revert(args):
+    """Phase 24: Undo a commit by creating a new commit with the inverse changes."""
+    if not args:
+        print("usage: twig revert <commit>", file=sys.stderr)
+        sys.exit(1)
+
+    target_hash = args[0]
+    try:
+        obj_type, data = read_object(target_hash)
+    except FileNotFoundError:
+        print(f"twig: commit '{target_hash}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    if obj_type != "commit":
+        print(f"twig: '{target_hash}' is not a commit", file=sys.stderr)
+        sys.exit(1)
+
+    target_tree = tree_from_commit(target_hash)
+    target_entries = parse_tree(target_tree) if target_tree else {}
+
+    # Get parent's tree (what to revert TO)
+    parents = get_all_parents(target_hash)
+    if not parents:
+        print("twig: cannot revert initial commit", file=sys.stderr)
+        sys.exit(1)
+
+    parent_entries = parse_tree(tree_from_commit(parents[0]))
+
+    # Get current HEAD tree
+    current_hash = get_current_commit()
+    current_entries = parse_tree(tree_from_commit(current_hash)) if current_hash else {}
+
+    # Apply the revert: go from target state back to parent state
+    new_entries = dict(current_entries)
+    all_files = sorted(
+        set(list(target_entries.keys()) + list(parent_entries.keys()))
+    )
+
+    for filepath in all_files:
+        target_sha = target_entries.get(filepath)
+        parent_sha = parent_entries.get(filepath)
+
+        if target_sha == parent_sha:
+            continue
+
+        if parent_sha:
+            new_entries[filepath] = parent_sha
+        elif not parent_sha and target_sha:
+            new_entries.pop(filepath, None)
+
+    # Build tree and commit
+    tree_content = b""
+    for filepath, sha1 in sorted(new_entries.items()):
+        mode = "100644"
+        name = filepath.encode()
+        tree_content += f"{mode} ".encode() + name + b"\0" + sha1.encode() + b"\n"
+
+    new_tree_hash = hash_object(tree_content, obj_type="tree", write=True)
+
+    # Parse original commit message
+    content = data.decode()
+    orig_message = ""
+    for line in content.split("\n"):
+        if line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+            orig_message = line
+            break
+
+    commit_content = f"tree {new_tree_hash}\n"
+    if current_hash:
+        commit_content += f"parent {current_hash}\n"
+    commit_content += f"author twig <twig@local> {int(time.time())}\n"
+    commit_content += f"\nRevert \"{orig_message}\"\n\nThis reverts commit {target_hash[:8]}.\n"
+
+    new_commit_hash = hash_object(commit_content.encode(), obj_type="commit", write=True)
+
+    branch = get_current_branch() or "main"
+    _reflog_write(branch, new_commit_hash, f"revert: {orig_message}")
+    ref_path = os.path.join(TWIG_DIR, "refs", "heads", branch)
+    with open(ref_path, "w") as f:
+        f.write(new_commit_hash + "\n")
+
+    print(f"[{branch} {new_commit_hash[:8]}] Revert \"{orig_message}\"")
+
+
+def cmd_grep(args):
+    """Phase 25: Search for a pattern in tracked files."""
+    if not args:
+        print("usage: twig grep <pattern> [<path> ...]", file=sys.stderr)
+        sys.exit(1)
+
+    pattern = args[0]
+    paths = args[1:] if len(args) > 1 else None
+
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    tree_hash = tree_from_commit(commit_hash)
+    entries = parse_tree(tree_hash) if tree_hash else {}
+
+    matches_found = False
+    for filepath, blob_hash in sorted(entries.items()):
+        if paths and filepath not in paths:
+            continue
+
+        _, blob_data = read_object(blob_hash)
+        try:
+            content = blob_data.decode()
+        except UnicodeDecodeError:
+            continue
+
+        for i, line in enumerate(content.splitlines(), 1):
+            if pattern in line:
+                print(f"{filepath}:{i}:{line}")
+                matches_found = True
+
+    if not matches_found:
+        print(f"no matches for '{pattern}'")
+
+
+def cmd_ls_tree(args):
+    """Phase 26a: List contents of a tree object."""
+    if not args:
+        # Default: show current commit's tree
+        commit_hash = get_current_commit()
+        if not commit_hash:
+            print("no commits yet", file=sys.stderr)
+            sys.exit(1)
+        tree_hash = tree_from_commit(commit_hash)
+    else:
+        tree_hash = args[0]
+
+    if not tree_hash:
+        print("twig: empty tree", file=sys.stderr)
+        sys.exit(1)
+
+    entries = parse_tree(tree_hash)
+    for filepath, sha1 in sorted(entries.items()):
+        _, data = read_object(sha1)
+        obj_type, _ = read_object(sha1)
+        print(f"100644 {obj_type} {sha1[:8]}  {filepath}")
+
+
+def cmd_ls_files(args):
+    """Phase 26b: List tracked files."""
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    tree_hash = tree_from_commit(commit_hash)
+    entries = parse_tree(tree_hash) if tree_hash else {}
+
+    show_staged = "--cached" in args or "-s" in args
+
+    if show_staged:
+        # Show staged (index) files
+        index_entries = read_index()
+        for filepath, sha1 in sorted(index_entries.items()):
+            print(f"{sha1[:8]} {filepath}")
+    else:
+        for filepath in sorted(entries.keys()):
+            print(f"{filepath}")
+
+
+def cmd_gc(args):
+    """Phase 27: Garbage collection — prune unreachable objects."""
+    print("Finding unreachable objects...")
+
+    # Collect all reachable objects
+    reachable = set()
+    heads_dir = os.path.join(TWIG_DIR, "refs", "heads")
+    tags_dir = os.path.join(TWIG_DIR, "refs", "tags")
+
+    refs_to_walk = []
+
+    if os.path.exists(heads_dir):
+        for name in os.listdir(heads_dir):
+            with open(os.path.join(heads_dir, name), "r") as f:
+                refs_to_walk.append(f.read().strip())
+
+    if os.path.exists(tags_dir):
+        for name in os.listdir(tags_dir):
+            with open(os.path.join(tags_dir, name), "r") as f:
+                refs_to_walk.append(f.read().strip())
+
+    # Also walk stash
+    stash_dir = os.path.join(TWIG_DIR, "stash")
+    if os.path.exists(stash_dir):
+        for name in os.listdir(stash_dir):
+            parent_path = os.path.join(stash_dir, name, "parent")
+            if os.path.exists(parent_path):
+                with open(parent_path, "r") as f:
+                    h = f.read().strip()
+                    if h:
+                        refs_to_walk.append(h)
+
+    # BFS to find all reachable objects
+    queue = deque(refs_to_walk)
+    while queue:
+        h = queue.popleft()
+        if h in reachable or not h:
+            continue
+        reachable.add(h)
+
+        try:
+            obj_type, data = read_object(h)
+        except (FileNotFoundError, Exception):
+            continue
+
+        if obj_type == "commit":
+            for line in data.decode().split("\n"):
+                if line.startswith("parent "):
+                    queue.append(line.split(" ", 1)[1])
+                elif line.startswith("tree "):
+                    queue.append(line.split(" ", 1)[1])
+        elif obj_type == "tree":
+            for line in data.decode().split("\n"):
+                if "\0" in line:
+                    parts = line.split("\0")
+                    if len(parts) == 2:
+                        queue.append(parts[1].strip())
+
+    # Scan all objects and prune unreachable ones
+    objects_dir = os.path.join(TWIG_DIR, "objects")
+    pruned = 0
+    kept = 0
+    for subdir in os.listdir(objects_dir):
+        subdir_path = os.path.join(objects_dir, subdir)
+        if not os.path.isdir(subdir_path) or len(subdir) != 2:
+            continue
+        for filename in os.listdir(subdir_path):
+            full_hash = subdir + filename
+            if full_hash not in reachable:
+                os.remove(os.path.join(subdir_path, filename))
+                pruned += 1
+            else:
+                kept += 1
+
+        # Remove empty directories
+        if not os.listdir(subdir_path):
+            os.rmdir(subdir_path)
+
+    print(f"Done. {kept} objects kept, {pruned} objects pruned.")
+
+
+def cmd_shortlog(args):
+    """Phase 28: Summarize log output by author."""
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    author_commits = {}
+    queue = deque([commit_hash])
+    visited = set()
+
+    while queue:
+        h = queue.popleft()
+        if h in visited:
+            continue
+        visited.add(h)
+
+        obj_type, data = read_object(h)
+        if obj_type != "commit":
+            continue
+
+        content = data.decode()
+        author = "twig"
+        message = ""
+        for line in content.split("\n"):
+            if line.startswith("author "):
+                parts = line.split(" ", 1)
+                if len(parts) > 1:
+                    author = parts[1].split(" <")[0]
+            elif line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+                message = line
+
+        if author not in author_commits:
+            author_commits[author] = []
+        author_commits[author].append(message)
+
+        for parent in get_all_parents(h):
+            queue.append(parent)
+
+    for author in sorted(author_commits.keys()):
+        messages = author_commits[author]
+        print(f"  {len(messages):4d}  {author}")
+        if "-s" not in args:
+            for msg in messages:
+                print(f"          {msg}")
+
+
+def cmd_describe(args):
+    """Phase 29: Describe the current commit using tags and distance."""
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    # Find tags
+    tags_dir = os.path.join(TWIG_DIR, "refs", "tags")
+    tag_map = {}
+    if os.path.exists(tags_dir):
+        for name in os.listdir(tags_dir):
+            with open(os.path.join(tags_dir, name), "r") as f:
+                h = f.read().strip()
+            tag_map[h] = name
+
+    # Check if current commit has a tag
+    if commit_hash in tag_map:
+        print(tag_map[commit_hash])
+        return
+
+    # Walk history looking for nearest tag
+    queue = deque([(commit_hash, 0)])
+    visited = set()
+    nearest_tag = None
+    nearest_dist = float("inf")
+
+    while queue:
+        h, dist = queue.popleft()
+        if h in visited:
+            continue
+        visited.add(h)
+
+        if h in tag_map and dist < nearest_dist:
+            nearest_tag = tag_map[h]
+            nearest_dist = dist
+
+        for parent in get_all_parents(h):
+            queue.append((parent, dist + 1))
+
+    if nearest_tag:
+        print(f"{nearest_tag}-{nearest_dist}-g{commit_hash[:8]}")
+    else:
+        print(f"{commit_hash[:8]}")
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: twig <command> [<args>]", file=sys.stderr)
@@ -1636,6 +1976,13 @@ def main():
         "reflog": lambda: cmd_reflog(args),
         "blame": lambda: cmd_blame(args),
         "config": lambda: cmd_config(args),
+        "revert": lambda: cmd_revert(args),
+        "grep": lambda: cmd_grep(args),
+        "ls-tree": lambda: cmd_ls_tree(args),
+        "ls-files": lambda: cmd_ls_files(args),
+        "gc": lambda: cmd_gc(args),
+        "shortlog": lambda: cmd_shortlog(args),
+        "describe": lambda: cmd_describe(args),
     }
 
     if command in commands:
