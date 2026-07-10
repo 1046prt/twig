@@ -7,6 +7,7 @@ import sys
 import time
 import zlib
 from collections import deque
+from datetime import datetime
 
 TWIG_DIR = ".twig"
 
@@ -589,7 +590,7 @@ def cmd_merge(args):
         if curr_changed and merge_changed:
             if hash_curr != hash_merge:
                 conflicts.append(filename)
-                merged_entries[filename] = hash_curr  # keep current for now
+                merged_entries[filename] = hash_curr
             else:
                 merged_entries[filename] = hash_curr
         elif curr_changed:
@@ -607,7 +608,6 @@ def cmd_merge(args):
         print("Automatic merge failed; fix conflicts and then commit the result.")
         return
 
-    # Build merged tree
     tree_content = b""
     for filepath, sha1 in sorted(merged_entries.items()):
         mode = "100644"
@@ -616,7 +616,6 @@ def cmd_merge(args):
 
     merged_tree_hash = hash_object(tree_content, obj_type="tree", write=True)
 
-    # Create merge commit with two parents
     commit_content = f"tree {merged_tree_hash}\n"
     commit_content += f"parent {current_hash}\n"
     commit_content += f"parent {merge_hash}\n"
@@ -625,13 +624,227 @@ def cmd_merge(args):
 
     commit_hash = hash_object(commit_content.encode(), obj_type="commit", write=True)
 
-    # Update current branch
     current_branch = get_current_branch() or "main"
     ref_path = os.path.join(TWIG_DIR, "refs", "heads", current_branch)
     with open(ref_path, "w") as f:
         f.write(commit_hash + "\n")
 
     print(f"Merge made by twig.")
+
+
+def cmd_status(args):
+    """Phase 10: Show working tree status — staged, unstaged, untracked."""
+    commit_hash = get_current_commit()
+    head_tree = tree_from_commit(commit_hash) if commit_hash else None
+    head_entries = parse_tree(head_tree) if head_tree else {}
+    index_entries = read_index()
+
+    staged = []
+    unstaged = []
+    untracked = []
+
+    # Check index vs HEAD
+    for filepath, sha1 in sorted(index_entries.items()):
+        if filepath not in head_entries:
+            staged.append(("new", filepath))
+        elif head_entries[filepath] != sha1:
+            staged.append(("modified", filepath))
+
+    # Deleted from index but was in HEAD
+    for filepath in head_entries:
+        if filepath not in index_entries:
+            staged.append(("deleted", filepath))
+
+    # Check working tree vs index
+    for filepath, index_sha1 in sorted(index_entries.items()):
+        if not os.path.exists(filepath):
+            unstaged.append(("deleted", filepath))
+            continue
+
+        with open(filepath, "rb") as f:
+            data = f.read()
+        work_sha1 = hash_object(data, write=False)
+        if work_sha1 != index_sha1:
+            unstaged.append(("modified", filepath))
+
+    # Check for untracked files
+    all_tracked = set(list(head_entries.keys()) + list(index_entries.keys()))
+    for entry in os.listdir("."):
+        if entry.startswith(".") or entry == "twig.py" or entry == "__pycache__":
+            continue
+        if os.path.isfile(entry) and entry not in all_tracked:
+            untracked.append(entry)
+
+    # Print output
+    branch = get_current_branch() or "HEAD"
+    print(f"On branch {branch}")
+
+    if staged:
+        print("\nChanges to be committed:")
+        for op, filepath in staged:
+            print(f"  {op}: {filepath}")
+
+    if unstaged:
+        print("\nChanges not staged for commit:")
+        for op, filepath in unstaged:
+            print(f"  {op}: {filepath}")
+
+    if untracked:
+        print("\nUntracked files:")
+        for filepath in untracked:
+            print(f"  {filepath}")
+
+    if not staged and not unstaged and not untracked:
+        print("nothing to commit, working tree clean")
+
+
+def cmd_show(args):
+    """Phase 11: Show commit details + diff."""
+    if not args:
+        commit_hash = get_current_commit()
+    else:
+        commit_hash = args[0]
+
+    if not commit_hash:
+        print("no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    obj_type, data = read_object(commit_hash)
+    if obj_type != "commit":
+        print(f"twig: '{commit_hash}' is not a commit", file=sys.stderr)
+        sys.exit(1)
+
+    content = data.decode()
+    tree_hash = None
+    parent_hashes = []
+    author_line = ""
+    message = ""
+
+    for line in content.split("\n"):
+        if line.startswith("tree "):
+            tree_hash = line.split(" ", 1)[1]
+        elif line.startswith("parent "):
+            parent_hashes.append(line.split(" ", 1)[1])
+        elif line.startswith("author "):
+            author_line = line
+        elif line.strip() and not any(line.startswith(p) for p in ["tree ", "parent ", "author "]):
+            message = line
+
+    # Parse timestamp from author line
+    ts_str = ""
+    if author_line:
+        parts = author_line.rsplit(" ", 1)
+        if len(parts) == 2:
+            try:
+                ts = int(parts[1])
+                ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                ts_str = parts[1]
+
+    print(f"commit {commit_hash}")
+    print(f"Author: twig <twig@local>")
+    if ts_str:
+        print(f"Date:   {ts_str}")
+    print(f"\n    {message}")
+
+    # Show diff against parent
+    if parent_hashes:
+        parent_tree = tree_from_commit(parent_hashes[0])
+        diffs = diff_trees(parent_tree, tree_hash)
+    else:
+        # First commit — show all files as new
+        diffs = []
+        entries = parse_tree(tree_hash) if tree_hash else {}
+        for filepath, sha1 in sorted(entries.items()):
+            _, blob_data = read_object(sha1)
+            diffs.append((filepath, "new", blob_data.decode().splitlines()))
+
+    if diffs:
+        for filename, change_type, data_lines in diffs:
+            print(f"\ndiff --a/{filename}")
+            if change_type == "deleted":
+                print(f"deleted file {filename}")
+            elif change_type == "new":
+                print(f"new file {filename}")
+                for line in data_lines:
+                    print(f"+{line}")
+            elif change_type == "modified":
+                for op, line in data_lines:
+                    print(f"{op} {line}")
+
+
+def cmd_cat_file(args):
+    """Phase 12: Inspect raw objects (plumbing command)."""
+    if not args:
+        print("usage: twig cat-file <hash>", file=sys.stderr)
+        sys.exit(1)
+
+    sha1 = args[0]
+    try:
+        obj_type, data = read_object(sha1)
+    except FileNotFoundError:
+        print(f"twig: object '{sha1}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"type: {obj_type}")
+    print(f"size: {len(data)}")
+    print("---")
+    if obj_type == "blob":
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.write(b"\n")
+    else:
+        print(data.decode(), end="")
+
+
+def cmd_rm(args):
+    """Phase 13: Remove files from the index (unstage)."""
+    if not args:
+        print("usage: twig rm <file> [<file> ...]", file=sys.stderr)
+        sys.exit(1)
+
+    entries = read_index()
+    for filepath in args:
+        if filepath not in entries:
+            print(f"twig: '{filepath}' not in index", file=sys.stderr)
+            continue
+        del entries[filepath]
+        print(f"removed {filepath} from index")
+
+    write_index(entries)
+
+
+def cmd_tag(args):
+    """Phase 14: Create or list tags."""
+    if not args:
+        tags_dir = os.path.join(TWIG_DIR, "refs", "tags")
+        if not os.path.exists(tags_dir):
+            print("no tags yet")
+            return
+        for name in sorted(os.listdir(tags_dir)):
+            ref_path = os.path.join(tags_dir, name)
+            with open(ref_path, "r") as f:
+                tag_hash = f.read().strip()
+            print(f"{name} -> {tag_hash[:8]}")
+        return
+
+    tag_name = args[0]
+    tag_path = os.path.join(TWIG_DIR, "refs", "tags", tag_name)
+    if os.path.exists(tag_path):
+        print(f"twig: tag '{tag_name}' already exists", file=sys.stderr)
+        sys.exit(1)
+
+    commit_hash = get_current_commit()
+    if not commit_hash:
+        print("twig: no commits yet", file=sys.stderr)
+        sys.exit(1)
+
+    # Store as tag object (lightweight — just a ref for now)
+    # Full annotated tag would create a "tag" type object; keeping it simple
+    os.makedirs(os.path.dirname(tag_path), exist_ok=True)
+    with open(tag_path, "w") as f:
+        f.write(commit_hash + "\n")
+
+    print(f"created tag '{tag_name}' at {commit_hash[:8]}")
 
 
 def main():
@@ -652,6 +865,11 @@ def main():
         "branch": lambda: cmd_branch(args),
         "diff": lambda: cmd_diff(args),
         "merge": lambda: cmd_merge(args),
+        "status": lambda: cmd_status(args),
+        "show": lambda: cmd_show(args),
+        "cat-file": lambda: cmd_cat_file(args),
+        "rm": lambda: cmd_rm(args),
+        "tag": lambda: cmd_tag(args),
     }
 
     if command in commands:
